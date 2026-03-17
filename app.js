@@ -424,7 +424,7 @@ class DatabaseManager {
         barcodeShowName: '1',
         barcodeShowPrice: '1',
         barcodeFontSize: '12',
-        barcodeLabelSize: '58x38',
+        barcodeSize: '58x38',
         autoBackup: '1',
         lowStockAlert: '5',
         expiryAlertDays: '30',
@@ -435,7 +435,7 @@ class DatabaseManager {
         stockWarningQty:    '15',
         stockCriticalQty:   '10',
         notifEnabled: '1',
-        notifInApp: '1',
+        notifyInApp: '1',
         notifyLogin: '0',
         debtInterestRate: '0',
         debtInterestType: 'daily'
@@ -1226,7 +1226,7 @@ class NotificationManager {
   async _scheduleChecks() {
     if (!this.db) return;
     
-    const settings = await this.db.get('settings', 'notificationsEnabled');
+    const settings = await this.db.get('settings', 'notifEnabled');
     if (settings?.value !== '1') return;
     
     await this._checkConditions();
