@@ -367,28 +367,63 @@ app.post('/api/print', async (req, res) => {
   const { html, printerName, labelSize } = req.body;
   if (!html) return res.status(400).json({ error: 'missing_html' });
 
-  try {
-    const { execSync, exec } = require('child_process');
-    const os   = require('os');
-    const tmpF = path.join(os.tmpdir(), `posdz_label_${Date.now()}.html`);
-    fs.writeFileSync(tmpF, html, 'utf8');
+  const { exec } = require('child_process');
+  const os   = require('os');
+  const tmpF = path.join(os.tmpdir(), `posdz_print_${Date.now()}.html`);
 
-    // اختيار الطابعة: المحددة أو الافتراضية
-    const printer = (printerName && printerName !== 'الطابعة الافتراضية')
-      ? printerName : '';
+  // تنظيف الملف المؤقت بعد الانتهاء
+  const cleanup = () => { try { fs.unlinkSync(tmpF); } catch(_) {} };
+
+  // اسم الطابعة المحدد
+  const printer = (printerName && printerName.trim() && printerName !== 'الطابعة الافتراضية')
+    ? printerName.trim() : '';
+
+  try {
+    fs.writeFileSync(tmpF, html, 'utf8');
 
     let cmd = '';
 
     if (process.platform === 'win32') {
-      // Windows: SumatraPDF (الأفضل للطباعة الصامتة) أو mshta
+
+      // ── الخيار 1: SumatraPDF (الأسرع والأدق للطباعة الحرارية) ──
       const sumatra = 'C:\\Program Files\\SumatraPDF\\SumatraPDF.exe';
       if (fs.existsSync(sumatra)) {
         const pFlag = printer ? `-print-to "${printer}"` : '-print-to-default';
         cmd = `"${sumatra}" ${pFlag} -silent "${tmpF}"`;
+
       } else {
-        // Fallback: PowerShell + IE print
-        const pArg = printer ? `-Printer "${printer}"` : '';
-        cmd = `powershell -NoProfile -Command "Start-Process '${tmpF}' -Verb Print ${pArg} -Wait"`;
+        // ── الخيار 2: Microsoft Edge Headless (مثبّت على Windows 10/11) ──
+        const edgePaths = [
+          'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+          'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+        ];
+        const chromePaths = [
+          'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+          'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        ];
+
+        let browserPath = null;
+        for (const p of [...edgePaths, ...chromePaths]) {
+          if (fs.existsSync(p)) { browserPath = p; break; }
+        }
+
+        // تحويل المسار إلى file:// URL
+        const fileUrl = 'file:///' + tmpF.replace(/\\/g, '/');
+
+        if (browserPath) {
+          // Edge/Chrome headless — يطبع مباشرة على الطابعة المحددة
+          const pFlag = printer ? `--print-to-printer="${printer}"` : '';
+          cmd = `"${browserPath}" --headless=new --disable-gpu --no-first-run --no-default-browser-check --no-sandbox ${pFlag} --no-pdf-header-footer "${fileUrl}"`;
+        } else {
+          // ── الخيار 3 (آخر ملجأ): PowerShell مع msedge من PATH ──
+          const safeFile = fileUrl.replace(/'/g, "''");
+          const safePrinter = printer.replace(/'/g, "''");
+          if (printer) {
+            cmd = `powershell -NoProfile -WindowStyle Hidden -Command "msedge --headless=new --disable-gpu --print-to-printer='${safePrinter}' --no-pdf-header-footer '${safeFile}'"`;
+          } else {
+            cmd = `powershell -NoProfile -WindowStyle Hidden -Command "msedge --headless=new --disable-gpu --kiosk-printing --no-pdf-header-footer '${safeFile}'"`;
+          }
+        }
       }
 
     } else if (process.platform === 'linux') {
@@ -400,22 +435,31 @@ app.post('/api/print', async (req, res) => {
       cmd = `lpr ${pFlag} "${tmpF}"`;
     }
 
-    if (cmd) {
-      exec(cmd, { timeout: 15000 }, (err) => {
-        setTimeout(() => { try { fs.unlinkSync(tmpF); } catch(_) {} }, 10000);
-        if (err) {
-          log('PRINT', `تحذير: ${err.message}`);
-        }
-      });
-      const usedPrinter = printer || 'الطابعة الافتراضية';
-      log('PRINT', `✅ أُرسل للطابعة: ${usedPrinter} | حجم: ${labelSize || '?'}`);
-      res.json({ status: 'ok', printer: usedPrinter });
-    } else {
-      res.status(503).json({ error: 'unsupported_platform' });
+    if (!cmd) {
+      cleanup();
+      return res.status(503).json({ error: 'unsupported_platform' });
     }
 
+    // ✅ انتظار النتيجة الحقيقية قبل الرد (إصلاح الخطأ الرئيسي)
+    await new Promise((resolve, reject) => {
+      exec(cmd, { timeout: 25000 }, (err, stdout, stderr) => {
+        setTimeout(cleanup, 8000);
+        if (err) {
+          reject(new Error(stderr || err.message));
+        } else {
+          resolve();
+        }
+      });
+    });
+
+    const usedPrinter = printer || 'الطابعة الافتراضية';
+    log('PRINT', `✅ طُبع على: ${usedPrinter} | حجم: ${labelSize || '?'}`);
+    res.json({ status: 'ok', printer: usedPrinter });
+
   } catch(e) {
-    log('PRINT', `خطأ: ${e.message}`);
+    cleanup();
+    log('PRINT', `❌ فشل الطباعة: ${e.message}`);
+    // إرسال الخطأ الحقيقي للواجهة بدل الـ OK الكاذبة
     res.status(500).json({ error: e.message });
   }
 });
