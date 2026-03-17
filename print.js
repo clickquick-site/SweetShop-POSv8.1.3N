@@ -57,7 +57,7 @@
      طباعة صامتة عبر server.js
      ترجع true إذا نجحت، false إذا يجب الرجوع للـ fallback
      ══════════════════════════════════════════════════════ */
-  async function _silentPrint(html, css, printerName) {
+  async function _silentPrint(html, css, printerName, paperMm) {
     var fullHtml =
       '<!DOCTYPE html>\n<html dir="rtl" lang="ar">\n<head>\n' +
       '<meta charset="UTF-8"/>\n' +
@@ -68,8 +68,8 @@
       var res = await fetch(_serverUrl() + '/api/print', {
         method : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body   : JSON.stringify({ html: fullHtml, printerName: printerName || '' }),
-        signal : AbortSignal.timeout(8000)
+        body   : JSON.stringify({ html: fullHtml, printerName: printerName || '', paperMm: paperMm || 80 }),
+        signal : AbortSignal.timeout(30000)
       });
       var data = await res.json();
       if (data.status === 'ok') {
@@ -306,7 +306,7 @@
       '.db{border-top:1px dashed #999;margin-top:5px;}';
 
     var printerName = await cfg('printerInvoice', '');
-    var silent = await _silentPrint(html, css, printerName);
+    var silent = await _silentPrint(html, css, printerName, paperMm);
     if (!silent) {
       var w = openWin(html, css, kindLabel + ' ' + invNum);
       doPrint(w);
@@ -412,7 +412,7 @@
       '.lprice{font-size:' + FSprice + 'px;font-weight:900;text-align:center;margin-top:.3mm;}';
 
     var printerName = await cfg('printerBarcode', '');
-    var silent = await _silentPrint(labels + initJS, css, printerName);
+    var silent = await _silentPrint(labels + initJS, css, printerName, sz.w);
     if (!silent) {
       var w = openWin(labels + initJS, css, 'باركود: ' + name);
       doPrint(w);
