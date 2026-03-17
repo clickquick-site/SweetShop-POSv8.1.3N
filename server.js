@@ -1,8 +1,8 @@
 // ============================================================
-//  POS DZ — server.js  v6.0.0
-//  سيرفر Node.js: البريد Gmail + المزامنة LAN + SMS
+//  POS DZ — server.js  v7.0.0
+//  سيرفر Node.js: البريد Gmail + المزامنة LAN + SMS + طباعة صامتة
 //  التشغيل: node server.js
-//  المتطلبات: npm install express nodemailer cors
+//  المتطلبات: npm install express nodemailer cors puppeteer-core
 // ============================================================
 
 'use strict';
@@ -12,6 +12,8 @@ const nodemailer = require('nodemailer');
 const cors       = require('cors');
 const path       = require('path');
 const fs         = require('fs');
+const os         = require('os');
+const { exec }   = require('child_process');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -33,7 +35,7 @@ function loadConfig() {
     smsToken:         '',
     smsFrom:          '',
     smsEnabled:       false,
-    syncStore:        {},      // بيانات المزامنة المشتركة
+    syncStore:        {},
   };
 }
 function saveConfig(cfg) {
@@ -54,17 +56,204 @@ function log(type, msg) {
 }
 
 // ════════════════════════════════════════════════════════════
-//  API: Ping (فحص الاتصال)
+//  وحدة الطباعة الاحترافية — PrintEngine v2
+//
+//  التدفق الكامل:
+//  1. puppeteer-core يُشغِّل Edge/Chrome الموجود على الجهاز
+//  2. يُحوِّل HTML → PDF بدقة كاملة مع تحميل JsBarcode
+//  3. SumatraPDF يطبع PDF صامتاً على الطابعة المحددة (إن وُجد)
+//  4. Fallback: PowerShell Shell.Application -Verb PrintTo
+//  5. Fallback أخير: -Verb Print (الطابعة الافتراضية)
+//
+//  لا يحتاج أي برنامج خارجي — فقط:
+//  npm install puppeteer-core   (مكتبة JS خالصة، تستخدم Edge المثبّت)
+// ════════════════════════════════════════════════════════════
+
+// ── البحث عن Chrome أو Edge على الجهاز ────────────────────
+function _findBrowser() {
+  const candidates = [
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+// ── البحث عن SumatraPDF (اختياري — يُحسِّن الطباعة) ────────
+function _findSumatraPDF() {
+  const candidates = [
+    path.join(__dirname, 'SumatraPDF.exe'),
+    path.join(__dirname, 'tools', 'SumatraPDF.exe'),
+    'C:\\Program Files\\SumatraPDF\\SumatraPDF.exe',
+    'C:\\Program Files (x86)\\SumatraPDF\\SumatraPDF.exe',
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+// ── تنفيذ أمر shell مع انتظار النتيجة الحقيقية ────────────
+function _execPromise(cmd, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, { timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
+      if (err) reject(new Error(stderr || err.message));
+      else     resolve(stdout);
+    });
+  });
+}
+
+// ── المحرك الرئيسي: HTML → PDF → طابعة ─────────────────────
+async function _printEngine(html, printerName, paperMm) {
+
+  let puppeteer;
+  try {
+    puppeteer = require('puppeteer-core');
+  } catch(e) {
+    throw new Error(
+      'puppeteer-core غير مثبّت.\n' +
+      'افتح مجلد التطبيق في Terminal ونفّذ:\n' +
+      'npm install puppeteer-core'
+    );
+  }
+
+  const browserPath = _findBrowser();
+  if (!browserPath) {
+    throw new Error('لم يُعثر على Microsoft Edge أو Chrome — تأكد من تثبيت أحدهما');
+  }
+
+  // ملفات مؤقتة
+  const ts      = Date.now();
+  const tmpHtml = path.join(os.tmpdir(), `posdz_${ts}.html`);
+  const tmpPdf  = path.join(os.tmpdir(), `posdz_${ts}.pdf`);
+  const cleanup = (files) => files.forEach(f => { try { fs.unlinkSync(f); } catch(_) {} });
+
+  // ── المرحلة 1: كتابة HTML مؤقتاً ─────────────────────────
+  fs.writeFileSync(tmpHtml, html, 'utf8');
+
+  // ── المرحلة 2: تشغيل puppeteer ───────────────────────────
+  const browser = await puppeteer.launch({
+    executablePath: browserPath,
+    headless:       'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
+  });
+
+  try {
+    const page = await browser.newPage();
+
+    // تحميل HTML وانتظار اكتمال كل السكريبتات (JsBarcode CDN)
+    const fileUrl = 'file:///' + tmpHtml.replace(/\\/g, '/');
+    await page.goto(fileUrl, { waitUntil: 'networkidle0', timeout: 15000 });
+
+    // انتظار 600ms إضافية لضمان رسم SVG الباركودات
+    await new Promise(r => setTimeout(r, 600));
+
+    // توليد PDF بأبعاد الورق الحراري الدقيقة
+    const pdfBuffer = await page.pdf({
+      width:           `${paperMm}mm`,
+      height:          'auto',
+      printBackground: true,
+      margin: { top: '1mm', bottom: '2mm', left: '1mm', right: '1mm' },
+    });
+
+    fs.writeFileSync(tmpPdf, pdfBuffer);
+
+  } finally {
+    await browser.close();
+    cleanup([tmpHtml]);
+  }
+
+  // ── المرحلة 3: PDF → طابعة ───────────────────────────────
+  try {
+    await _sendPdfToPrinter(tmpPdf, printerName);
+  } finally {
+    // حذف PDF بعد 8 ثوانٍ (وقت كافٍ لإرساله لـ spooler)
+    setTimeout(() => cleanup([tmpPdf]), 8000);
+  }
+}
+
+// ── إرسال PDF إلى طابعة محددة — ثلاث طبقات fallback ────────
+async function _sendPdfToPrinter(pdfPath, printerName) {
+  const printer = (printerName || '').trim();
+
+  if (process.platform === 'win32') {
+
+    // ── طبقة 1: SumatraPDF ─── الأدق والأسرع للطابعات الحرارية
+    const sumatra = _findSumatraPDF();
+    if (sumatra) {
+      const pFlag = printer
+        ? `-print-to "${printer}"`
+        : '-print-to-default';
+      await _execPromise(
+        `"${sumatra}" ${pFlag} -silent -exit-when-done "${pdfPath}"`,
+        20000
+      );
+      log('PRINT', `✅ SumatraPDF → [${printer || 'افتراضية'}]`);
+      return;
+    }
+
+    // ── طبقة 2: Shell.Application InvokeVerb PrintTo ─────────
+    // يستخدم Windows Shell verb handler (Edge PDF reader) لطباعة
+    // على طابعة محددة — يعمل على Windows 10/11 بدون تثبيت إضافي
+    if (printer) {
+      // تهرُّب من الأقواس والشرطات في اسم الطابعة
+      const safeFile    = pdfPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      const safePrinter = printer.replace(/'/g, "\\'").replace(/"/g, '\\"');
+
+      const ps = [
+        'powershell -NoProfile -WindowStyle Hidden -Command',
+        `"$f = '${safeFile}';`,
+        `$p = '${safePrinter}';`,
+        `$sh = New-Object -ComObject 'Shell.Application';`,
+        `$item = $sh.NameSpace(0).ParseName($f);`,
+        `$item.InvokeVerb('PrintTo \\\"' + $p + '\\\"')"`,
+      ].join(' ');
+
+      try {
+        await _execPromise(ps, 20000);
+        log('PRINT', `✅ Shell PrintTo → [${printer}]`);
+        return;
+      } catch(e) {
+        log('PRINT', `⚠️ Shell PrintTo فشل → ننتقل للـ Fallback: ${e.message}`);
+      }
+    }
+
+    // ── طبقة 3: Start-Process -Verb Print ─── الطابعة الافتراضية
+    const safeFile3 = pdfPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    await _execPromise(
+      `powershell -NoProfile -WindowStyle Hidden -Command "Start-Process '${safeFile3}' -Verb 'Print' -Wait"`,
+      20000
+    );
+    log('PRINT', `✅ Start-Process Print → [افتراضية]`);
+
+  } else {
+    // Linux / macOS
+    const pFlag = printer ? `-d "${printer}"` : '';
+    await _execPromise(`lpr ${pFlag} "${pdfPath}"`, 15000);
+    log('PRINT', `✅ lpr → [${printer || 'افتراضية'}]`);
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  API: Ping
 // ════════════════════════════════════════════════════════════
 app.get('/api/ping', (req, res) => {
-  res.json({ status:'ok', version:'6.0.0', time: new Date().toISOString() });
+  res.json({ status:'ok', version:'7.0.0', time: new Date().toISOString() });
 });
 
 // ════════════════════════════════════════════════════════════
-//  API: Config (حفظ/قراءة الإعدادات من الواجهة)
+//  API: Config
 // ════════════════════════════════════════════════════════════
 app.get('/api/config', (req, res) => {
-  // لا نُرسل كلمات المرور للواجهة — فقط حالة التفعيل
   res.json({
     emailConfigured: !!(config.emailSender && config.emailAppPassword),
     smsConfigured:   !!(config.smsSid && config.smsToken),
@@ -87,39 +276,29 @@ app.post('/api/config', (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  API: Email — Gmail عبر Nodemailer
+//  API: Email
 // ════════════════════════════════════════════════════════════
 app.post('/api/email', async (req, res) => {
   const { to, subject, body, html } = req.body;
-
   if (!config.emailSender || !config.emailAppPassword) {
-    log('EMAIL', 'غير مُهيَّأ — أدخل البريد وكلمة التطبيق في الإعدادات');
+    log('EMAIL', 'غير مُهيَّأ');
     return res.status(503).json({ error: 'email_not_configured' });
   }
-  if (!to || !subject) {
-    return res.status(400).json({ error: 'missing_fields' });
-  }
+  if (!to || !subject) return res.status(400).json({ error: 'missing_fields' });
 
   try {
     const transporter = nodemailer.createTransport({
       service: 'gmail',
-      auth: {
-        user: config.emailSender,
-        pass: config.emailAppPassword,   // App Password من Google Account
-      },
+      auth: { user: config.emailSender, pass: config.emailAppPassword },
     });
-
     const info = await transporter.sendMail({
-      from:    `"POS DZ" <${config.emailSender}>`,
-      to,
-      subject,
-      text:    body  || '',
-      html:    html  || body || '',
+      from: `"POS DZ" <${config.emailSender}>`,
+      to, subject,
+      text: body || '',
+      html: html || body || '',
     });
-
-    log('EMAIL', `إرسال ناجح → ${to} | ID: ${info.messageId}`);
+    log('EMAIL', `إرسال ناجح → ${to}`);
     res.json({ status:'ok', messageId: info.messageId });
-
   } catch(e) {
     log('EMAIL', `خطأ: ${e.message}`);
     res.status(500).json({ error: e.message });
@@ -127,39 +306,36 @@ app.post('/api/email', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  API: SMS — Twilio (⛔ معطّل — يُفعَّل بإضافة SID+Token)
+//  API: SMS — Twilio
 // ════════════════════════════════════════════════════════════
 app.post('/api/sms', async (req, res) => {
-  if (!config.smsEnabled) {
-    return res.status(503).json({ error: 'sms_disabled' });
-  }
-  if (!config.smsSid || !config.smsToken || !config.smsFrom) {
-    return res.status(503).json({ error: 'sms_not_configured' });
-  }
+  if (!config.smsEnabled)                               return res.status(503).json({ error: 'sms_disabled' });
+  if (!config.smsSid || !config.smsToken || !config.smsFrom) return res.status(503).json({ error: 'sms_not_configured' });
 
   const { to, message } = req.body;
-  if (!to || !message) {
-    return res.status(400).json({ error: 'missing_fields' });
-  }
+  if (!to || !message) return res.status(400).json({ error: 'missing_fields' });
 
   try {
-    // Twilio REST API — بدون مكتبة خارجية
-    const auth    = Buffer.from(`${config.smsSid}:${config.smsToken}`).toString('base64');
-    const body    = new URLSearchParams({ To:to, From:config.smsFrom, Body:message }).toString();
-    const https   = require('https');
-    const options = {
-      hostname: 'api.twilio.com',
-      path:     `/2010-04-01/Accounts/${config.smsSid}/Messages.json`,
-      method:   'POST',
-      headers:  { 'Authorization':'Basic '+auth, 'Content-Type':'application/x-www-form-urlencoded', 'Content-Length':Buffer.byteLength(body) }
-    };
+    const auth  = Buffer.from(`${config.smsSid}:${config.smsToken}`).toString('base64');
+    const body  = new URLSearchParams({ To:to, From:config.smsFrom, Body:message }).toString();
+    const https = require('https');
 
     await new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'api.twilio.com',
+        path:     `/2010-04-01/Accounts/${config.smsSid}/Messages.json`,
+        method:   'POST',
+        headers:  {
+          'Authorization':  'Basic ' + auth,
+          'Content-Type':   'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      };
       const r = https.request(options, (res2) => {
         let data = '';
         res2.on('data', d => data += d);
         res2.on('end', () => {
-          try { const j=JSON.parse(data); j.sid ? resolve(j) : reject(new Error(j.message||'SMS error')); }
+          try { const j = JSON.parse(data); j.sid ? resolve(j) : reject(new Error(j.message || 'SMS error')); }
           catch(e) { reject(e); }
         });
       });
@@ -170,7 +346,6 @@ app.post('/api/sms', async (req, res) => {
 
     log('SMS', `إرسال ناجح → ${to}`);
     res.json({ status:'ok' });
-
   } catch(e) {
     log('SMS', `خطأ: ${e.message}`);
     res.status(500).json({ error: e.message });
@@ -179,51 +354,37 @@ app.post('/api/sms', async (req, res) => {
 
 // ════════════════════════════════════════════════════════════
 //  API: مزامنة LAN
-//  يستقبل التغييرات ويوزعها على الأجهزة الأخرى
 // ════════════════════════════════════════════════════════════
-
-// تخزين مؤقت في الذاكرة (يُحفظ في config للدوام)
 if (!config.syncStore) config.syncStore = {};
-
-// قائمة الأجهزة المتصلة (SSE)
 const sseClients = new Set();
 
-// استقبال البيانات من أي جهاز
 app.post('/api/sync', (req, res) => {
   const { action, store, data } = req.body;
-  if (!store || !action) {
-    return res.status(400).json({ error: 'missing_fields' });
-  }
+  if (!store || !action) return res.status(400).json({ error: 'missing_fields' });
 
-  // تحديث الـ store في الذاكرة
   if (!config.syncStore[store]) config.syncStore[store] = [];
 
   if (action === 'add' || action === 'update') {
     const idx = config.syncStore[store].findIndex(r => r.id === data?.id);
     if (idx >= 0) config.syncStore[store][idx] = data;
     else          config.syncStore[store].push(data);
-
   } else if (action === 'delete') {
     config.syncStore[store] = config.syncStore[store].filter(r => r.id !== data?.id);
   }
 
-  // بث التغيير لكل الأجهزة المتصلة (SSE)
   const event = JSON.stringify({ action, store, data, ts: Date.now() });
   sseClients.forEach(client => {
     try { client.write(`data: ${event}\n\n`); } catch(e) { sseClients.delete(client); }
   });
 
-  log('SYNC', `${action.toUpperCase()} → ${store} (${sseClients.size} أجهزة متصلة)`);
+  log('SYNC', `${action.toUpperCase()} → ${store} (${sseClients.size} أجهزة)`);
   res.json({ status:'ok' });
 });
 
-// سحب كل بيانات store
 app.get('/api/data/:store', (req, res) => {
-  const store = req.params.store;
-  res.json(config.syncStore[store] || []);
+  res.json(config.syncStore[req.params.store] || []);
 });
 
-// SSE — اشتراك الأجهزة لتلقي التحديثات فوراً
 app.get('/api/subscribe', (req, res) => {
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -231,9 +392,8 @@ app.get('/api/subscribe', (req, res) => {
   res.flushHeaders();
 
   sseClients.add(res);
-  log('SSE', `جهاز جديد متصل — إجمالي: ${sseClients.size}`);
+  log('SSE', `جهاز جديد — إجمالي: ${sseClients.size}`);
 
-  // إرسال نبضة كل 30 ثانية لإبقاء الاتصال
   const heartbeat = setInterval(() => {
     try { res.write(': heartbeat\n\n'); } catch(e) { clearInterval(heartbeat); }
   }, 30000);
@@ -245,18 +405,17 @@ app.get('/api/subscribe', (req, res) => {
   });
 });
 
-// حفظ دوري لـ syncStore (كل 60 ثانية)
 setInterval(() => saveConfig(config), 60000);
 
 // ════════════════════════════════════════════════════════════
-//  API: إرسال تقرير يومي مجدوَل (يُستدعى من cron أو يدوياً)
+//  API: تقرير يومي
 // ════════════════════════════════════════════════════════════
 app.post('/api/daily-report', async (req, res) => {
   const { report } = req.body;
   if (!report) return res.status(400).json({ error: 'missing_report' });
 
-  const to  = config.emailRecipient || req.body.to;
-  if (!to)  return res.status(400).json({ error: 'no_recipient' });
+  const to = config.emailRecipient || req.body.to;
+  if (!to) return res.status(400).json({ error: 'no_recipient' });
 
   try {
     const currency = report.currency || 'DA';
@@ -295,15 +454,18 @@ app.post('/api/daily-report', async (req, res) => {
             <td style="padding:10px;border:1px solid #ddd;">${report.salesCount||0}</td>
           </tr>
         </table>
-        <p style="margin-top:20px;font-size:12px;color:#999;text-align:center;">POS DZ v6.0.0</p>
+        <p style="margin-top:20px;font-size:12px;color:#999;text-align:center;">POS DZ v7.0.0</p>
       </div>`;
 
     const transporter = nodemailer.createTransport({
-      service:'gmail', auth:{ user:config.emailSender, pass:config.emailAppPassword }
+      service: 'gmail',
+      auth: { user: config.emailSender, pass: config.emailAppPassword },
     });
     await transporter.sendMail({
-      from:`"POS DZ" <${config.emailSender}>`,
-      to, subject:`📊 التقرير اليومي ${report.date||''} — POS DZ`, html
+      from: `"POS DZ" <${config.emailSender}>`,
+      to,
+      subject: `📊 التقرير اليومي ${report.date||''} — POS DZ`,
+      html,
     });
 
     log('REPORT', `تقرير يومي أُرسل → ${to}`);
@@ -315,7 +477,7 @@ app.post('/api/daily-report', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  API: قائمة الطابعات المثبتة على الجهاز
+//  API: قائمة الطابعات
 // ════════════════════════════════════════════════════════════
 app.get('/api/printers', async (req, res) => {
   try {
@@ -323,32 +485,20 @@ app.get('/api/printers', async (req, res) => {
     let printers = [];
 
     if (process.platform === 'win32') {
-      // Windows: PowerShell — يجلب أسماء الطابعات الحقيقية
       const out = execSync(
         'powershell -NoProfile -Command "Get-Printer | Select-Object -ExpandProperty Name"',
         { encoding: 'utf8', timeout: 5000 }
       );
       printers = out.split('\n').map(s => s.trim()).filter(Boolean);
-
     } else if (process.platform === 'linux') {
-      // Linux: lpstat
       try {
         const out = execSync('lpstat -a 2>/dev/null', { encoding: 'utf8', timeout: 3000 });
-        printers = out.split('\n')
-          .map(l => l.split(' ')[0].trim())
-          .filter(Boolean);
-      } catch(_) {
-        const out2 = execSync('lpstat -p 2>/dev/null | grep "^printer"', { encoding: 'utf8', timeout: 3000 });
-        printers = out2.split('\n').map(l => l.split(' ')[1]?.trim()).filter(Boolean);
-      }
-
+        printers = out.split('\n').map(l => l.split(' ')[0].trim()).filter(Boolean);
+      } catch(_) {}
     } else if (process.platform === 'darwin') {
-      // macOS
       const out = execSync('lpstat -p 2>/dev/null', { encoding: 'utf8', timeout: 3000 });
-      printers = out.split('\n')
-        .filter(l => l.startsWith('printer'))
-        .map(l => l.split(' ')[1]?.trim())
-        .filter(Boolean);
+      printers = out.split('\n').filter(l => l.startsWith('printer'))
+                    .map(l => l.split(' ')[1]?.trim()).filter(Boolean);
     }
 
     log('PRINTERS', `تم جلب ${printers.length} طابعة`);
@@ -360,106 +510,35 @@ app.get('/api/printers', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════
-//  API: طباعة ملصق الباركود
-//  يستقبل HTML ويطبعه على الطابعة المحددة
+//  API: الطباعة الصامتة الاحترافية  /api/print
+//
+//  المعطيات:
+//    html        : كامل محتوى HTML (فاتورة أو باركود)
+//    printerName : اسم الطابعة كما يظهر في Windows
+//    paperMm     : عرض الورق بالمم (اختياري — يُستخرج من @page تلقائياً)
 // ════════════════════════════════════════════════════════════
 app.post('/api/print', async (req, res) => {
-  const { html, printerName, labelSize } = req.body;
+  const { html, printerName, paperMm } = req.body;
   if (!html) return res.status(400).json({ error: 'missing_html' });
 
-  const { exec } = require('child_process');
-  const os   = require('os');
-  const tmpF = path.join(os.tmpdir(), `posdz_print_${Date.now()}.html`);
+  // استخراج حجم الورق من CSS @page إذا لم يُحدَّد صراحةً
+  let paper = parseInt(paperMm) || 0;
+  if (!paper) {
+    const m = html.match(/@page\s*\{[^}]*size:\s*(\d+)mm/);
+    paper = m ? parseInt(m[1]) : 80;
+  }
 
-  // تنظيف الملف المؤقت بعد الانتهاء
-  const cleanup = () => { try { fs.unlinkSync(tmpF); } catch(_) {} };
-
-  // اسم الطابعة المحدد
-  const printer = (printerName && printerName.trim() && printerName !== 'الطابعة الافتراضية')
-    ? printerName.trim() : '';
+  const printer = (printerName || '').trim();
 
   try {
-    fs.writeFileSync(tmpF, html, 'utf8');
-
-    let cmd = '';
-
-    if (process.platform === 'win32') {
-
-      // ── الخيار 1: SumatraPDF (الأسرع والأدق للطباعة الحرارية) ──
-      const sumatra = 'C:\\Program Files\\SumatraPDF\\SumatraPDF.exe';
-      if (fs.existsSync(sumatra)) {
-        const pFlag = printer ? `-print-to "${printer}"` : '-print-to-default';
-        cmd = `"${sumatra}" ${pFlag} -silent "${tmpF}"`;
-
-      } else {
-        // ── الخيار 2: Microsoft Edge Headless (مثبّت على Windows 10/11) ──
-        const edgePaths = [
-          'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-          'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-        ];
-        const chromePaths = [
-          'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-          'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-        ];
-
-        let browserPath = null;
-        for (const p of [...edgePaths, ...chromePaths]) {
-          if (fs.existsSync(p)) { browserPath = p; break; }
-        }
-
-        // تحويل المسار إلى file:// URL
-        const fileUrl = 'file:///' + tmpF.replace(/\\/g, '/');
-
-        if (browserPath) {
-          // Edge/Chrome headless — يطبع مباشرة على الطابعة المحددة
-          const pFlag = printer ? `--print-to-printer="${printer}"` : '';
-          cmd = `"${browserPath}" --headless=new --disable-gpu --no-first-run --no-default-browser-check --no-sandbox ${pFlag} --no-pdf-header-footer "${fileUrl}"`;
-        } else {
-          // ── الخيار 3 (آخر ملجأ): PowerShell مع msedge من PATH ──
-          const safeFile = fileUrl.replace(/'/g, "''");
-          const safePrinter = printer.replace(/'/g, "''");
-          if (printer) {
-            cmd = `powershell -NoProfile -WindowStyle Hidden -Command "msedge --headless=new --disable-gpu --print-to-printer='${safePrinter}' --no-pdf-header-footer '${safeFile}'"`;
-          } else {
-            cmd = `powershell -NoProfile -WindowStyle Hidden -Command "msedge --headless=new --disable-gpu --kiosk-printing --no-pdf-header-footer '${safeFile}'"`;
-          }
-        }
-      }
-
-    } else if (process.platform === 'linux') {
-      const pFlag = printer ? `-d "${printer}"` : '';
-      cmd = `lpr ${pFlag} "${tmpF}"`;
-
-    } else if (process.platform === 'darwin') {
-      const pFlag = printer ? `-d "${printer}"` : '';
-      cmd = `lpr ${pFlag} "${tmpF}"`;
-    }
-
-    if (!cmd) {
-      cleanup();
-      return res.status(503).json({ error: 'unsupported_platform' });
-    }
-
-    // ✅ انتظار النتيجة الحقيقية قبل الرد (إصلاح الخطأ الرئيسي)
-    await new Promise((resolve, reject) => {
-      exec(cmd, { timeout: 25000 }, (err, stdout, stderr) => {
-        setTimeout(cleanup, 8000);
-        if (err) {
-          reject(new Error(stderr || err.message));
-        } else {
-          resolve();
-        }
-      });
-    });
-
+    await _printEngine(html, printer, paper);
     const usedPrinter = printer || 'الطابعة الافتراضية';
-    log('PRINT', `✅ طُبع على: ${usedPrinter} | حجم: ${labelSize || '?'}`);
+    log('PRINT', `✅ طُبع | طابعة: [${usedPrinter}] | ورق: ${paper}mm`);
     res.json({ status: 'ok', printer: usedPrinter });
 
   } catch(e) {
-    cleanup();
-    log('PRINT', `❌ فشل الطباعة: ${e.message}`);
-    // إرسال الخطأ الحقيقي للواجهة بدل الـ OK الكاذبة
+    log('PRINT', `❌ فشل: ${e.message}`);
+    // عند الفشل: print.js يعرض dialog المتصفح كـ fallback تلقائي
     res.status(500).json({ error: e.message });
   }
 });
@@ -468,9 +547,15 @@ app.post('/api/print', async (req, res) => {
 //  تشغيل السيرفر
 // ════════════════════════════════════════════════════════════
 app.listen(PORT, '0.0.0.0', () => {
-  log('SERVER', `✅ POS DZ Server يعمل على المنفذ ${PORT}`);
-  log('SERVER', `🌐 الوصول المحلي: http://localhost:${PORT}`);
-  log('SERVER', `📡 الشبكة المحلية: http://<IP-الجهاز>:${PORT}`);
-  log('SERVER', `📧 البريد: ${config.emailSender ? '✅ مُهيَّأ' : '⚠️ يحتاج إعداد'}`);
-  log('SERVER', `📱 SMS:    ${config.smsEnabled   ? '✅ مُفعَّل' : '⛔ معطّل'}`);
+  log('SERVER', `✅ POS DZ Server v7.0.0 يعمل على المنفذ ${PORT}`);
+  log('SERVER', `🌐 الوصول المحلي:    http://localhost:${PORT}`);
+  log('SERVER', `📡 الشبكة المحلية:   http://<IP-الجهاز>:${PORT}`);
+  log('SERVER', `📧 البريد:   ${config.emailSender ? '✅ مُهيَّأ' : '⚠️ يحتاج إعداد'}`);
+  log('SERVER', `📱 SMS:      ${config.smsEnabled   ? '✅ مُفعَّل' : '⛔ معطّل'}`);
+
+  // فحص متطلبات الطباعة عند الإطلاق
+  const browser = _findBrowser();
+  const sumatra = _findSumatraPDF();
+  log('PRINT', `🖥️  المتصفح:    ${browser  ? `✅ ${path.basename(browser)}` : '❌ غير موجود'}`);
+  log('PRINT', `📄 SumatraPDF: ${sumatra  ? `✅ ${sumatra}` : '⚠️  غير موجود (Fallback نشط)'}`);
 });
