@@ -518,20 +518,33 @@ app.get('/api/printers', async (req, res) => {
 //    paperMm     : عرض الورق بالمم (اختياري — يُستخرج من @page تلقائياً)
 // ════════════════════════════════════════════════════════════
 app.post('/api/print', async (req, res) => {
-  const { html, printerName, paperMm } = req.body;
-  if (!html) return res.status(400).json({ error: 'missing_html' });
+  const { html, htmlBase64, printerName, paperMm } = req.body;
+
+  // ③ قبول base64 أو HTML خام للتوافق مع الإصدارات القديمة
+  let rawHtml = '';
+  if (htmlBase64) {
+    try {
+      rawHtml = Buffer.from(htmlBase64, 'base64').toString('utf8');
+    } catch(e) {
+      return res.status(400).json({ error: 'invalid_base64' });
+    }
+  } else if (html) {
+    rawHtml = html;
+  } else {
+    return res.status(400).json({ error: 'missing_html' });
+  }
 
   // استخراج حجم الورق من CSS @page إذا لم يُحدَّد صراحةً
   let paper = parseInt(paperMm) || 0;
   if (!paper) {
-    const m = html.match(/@page\s*\{[^}]*size:\s*(\d+)mm/);
+    const m = rawHtml.match(/@page\s*\{[^}]*size:\s*(\d+)mm/);
     paper = m ? parseInt(m[1]) : 80;
   }
 
   const printer = (printerName || '').trim();
 
   try {
-    await _printEngine(html, printer, paper);
+    await _printEngine(rawHtml, printer, paper);
     const usedPrinter = printer || 'الطابعة الافتراضية';
     log('PRINT', `✅ طُبع | طابعة: [${usedPrinter}] | ورق: ${paper}mm`);
     res.json({ status: 'ok', printer: usedPrinter });
