@@ -1,9 +1,21 @@
 /**
- * print.js — E-Commerce DZ · وحدة الطباعة الاحترافية
+ * print.js — POS DZ · وحدة الطباعة الاحترافية  v8.2.0
  * ═══════════════════════════════════════════════════════
  *  • فاتورة: 4 أنواع (عادية / دين / جزئي / تسديد)
  *  • باركود: SVG حقيقي داخل نافذة الطباعة عبر JsBarcode
  *  • @page دقيق لكل حجم ورق / ملصق
+ *
+ *  إصلاحات v8.2.0:
+ *  ① XSS: JSON.stringify بدل دمج النصوص في JsBarcode
+ *  ② AbortController بدل AbortSignal.timeout (دعم أوسع)
+ *  ③ HTML → base64 قبل الإرسال (يمنع crash السيرفر)
+ *  ④ حساب topMm مصحح (خطأ قسمة مزدوجة على PX_MM)
+ *  ⑤ window.open: فحص محكم قبل الاستخدام
+ *  ⑥ حد أقصى 200 نسخة باركود (بدل 500)
+ *  ⑦ Toast "جاري الطباعة..." أثناء الانتظار
+ *  ⑧ @media print للطابعات الحرارية
+ *  ⑨ عرض الباركود قابل للضبط من الإعدادات
+ *  ⑩ Cache للإعدادات (يقرأ IndexedDB مرة واحدة فقط)
  * ═══════════════════════════════════════════════════════
  */
 
@@ -24,12 +36,30 @@
     '70x50' :{w:70 ,h:50}, '100x50':{w:100,h:50},
   };
 
-  /* قراءة اعداد */
+  /* ══════════════════════════════════════════════════════
+     ⑩ Cache للإعدادات — يقرأ IndexedDB مرة واحدة لكل مفتاح
+     ══════════════════════════════════════════════════════ */
+  var _SETTINGS_CACHE = {};
+
   function cfg(key, def) {
     if (def === undefined) def = '';
+    // إذا موجود في Cache أرجعه فوراً
+    if (_SETTINGS_CACHE[key] !== undefined) {
+      return Promise.resolve(_SETTINGS_CACHE[key]);
+    }
     return window.getSetting(key).then(function(v) {
-      return (v != null && v !== '') ? v : def;
-    }).catch(function() { return def; });
+      var val = (v != null && v !== '') ? v : def;
+      _SETTINGS_CACHE[key] = val;
+      return val;
+    }).catch(function() {
+      _SETTINGS_CACHE[key] = def;
+      return def;
+    });
+  }
+
+  /* مسح Cache عند الحاجة (يُستدعى من settings.html بعد الحفظ) */
+  function clearSettingsCache() {
+    _SETTINGS_CACHE = {};
   }
 
   /* تنسيق رقم */
@@ -45,9 +75,16 @@
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  /* ══════════════════════════════════════════════════════
-     مساعد: جلب عنوان الخادم
-     ══════════════════════════════════════════════════════ */
+  /* ③ تحويل HTML إلى base64 للإرسال الآمن */
+  function _toBase64(str) {
+    try {
+      return btoa(unescape(encodeURIComponent(str)));
+    } catch(e) {
+      return btoa(str);
+    }
+  }
+
+  /* مساعد: جلب عنوان الخادم */
   function _serverUrl() {
     return (localStorage.getItem('posdz_server_url') || 'http://localhost:3000')
            .replace(/\/$/, '');
@@ -55,7 +92,9 @@
 
   /* ══════════════════════════════════════════════════════
      طباعة صامتة عبر server.js
-     ترجع true إذا نجحت، false إذا يجب الرجوع للـ fallback
+     ② AbortController بدل AbortSignal.timeout
+     ③ HTML → base64 قبل الإرسال
+     ⑦ Toast "جاري الطباعة..." أثناء الانتظار
      ══════════════════════════════════════════════════════ */
   async function _silentPrint(html, css, printerName, paperMm) {
     var fullHtml =
@@ -64,28 +103,49 @@
       '<script src="' + JSBC_CDN + '"><\/script>\n' +
       '<style>' + css + '</style>\n</head>\n<body>' + html + '</body>\n</html>';
 
+    /* ② AbortController — يعمل في كل المتصفحات */
+    var controller = new AbortController();
+    var timer = setTimeout(function() { controller.abort(); }, 30000);
+
+    /* ⑦ Toast جاري الطباعة */
+    if (window.toast) window.toast.show('🖨️ جاري الطباعة...', 'info', 30000);
+
     try {
+      /* ③ إرسال base64 بدل النص الخام — يمنع crash السيرفر */
       var res = await fetch(_serverUrl() + '/api/print', {
         method : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body   : JSON.stringify({ html: fullHtml, printerName: printerName || '', paperMm: paperMm || 80 }),
-        signal : AbortSignal.timeout(30000)
+        body   : JSON.stringify({
+          htmlBase64  : _toBase64(fullHtml),
+          printerName : printerName || '',
+          paperMm     : paperMm    || 80,
+        }),
+        signal : controller.signal,
       });
+      clearTimeout(timer);
       var data = await res.json();
       if (data.status === 'ok') {
         if (window.toast) window.toast.show('✅ تمت الطباعة على: ' + (printerName || 'الطابعة الافتراضية'), 'success');
         return true;
       }
-    } catch (e) {}
+    } catch (e) {
+      clearTimeout(timer);
+    }
     return false;
   }
 
-  /* فتح نافذة طباعة — fallback عند غياب الخادم */
+  /* ══════════════════════════════════════════════════════
+     فتح نافذة طباعة — fallback عند غياب الخادم
+     ⑤ فحص محكم لـ window.open
+     ══════════════════════════════════════════════════════ */
   function openWin(html, css, title) {
     var w = window.open('', '_blank',
       'width=700,height=900,menubar=no,toolbar=no,location=no,status=no,scrollbars=yes');
-    if (!w) {
-      alert('فعّل النوافذ المنبثقة في المتصفح لتتمكن من الطباعة');
+    /* ⑤ فحص محكم: null أو مغلق أو محجوب */
+    if (!w || w.closed || typeof w.closed === 'undefined') {
+      if (window.toast) {
+        window.toast.show('⚠️ فعّل النوافذ المنبثقة في المتصفح لتتمكن من الطباعة', 'warning', 5000);
+      }
       return null;
     }
     w.document.write(
@@ -100,7 +160,7 @@
 
   /* تشغيل الطباعة — fallback */
   function doPrint(w) {
-    if (!w) return;
+    if (!w || w.closed || typeof w.closed === 'undefined') return;
     setTimeout(function() {
       if (!w.closed) {
         w.focus();
@@ -116,7 +176,7 @@
   async function printInvoice(sale, items) {
     if (!sale) return;
 
-    /* اعدادات */
+    /* اعدادات — مستفيدة من Cache ⑩ */
     var paper      = await cfg('paperSize',    '80mm');
     var storeName  = await cfg('storeName',    '');
     var storePhone = await cfg('storePhone',   '');
@@ -220,16 +280,15 @@
         '</tr>';
     }
 
-    /* باركود الفاتورة */
-    var safeInv = invNum.replace(/['"\\]/g, '');
-    var bcSection = showBC ?
+    /* ① باركود الفاتورة — JSON.stringify بدل دمج النصوص */
+    var bcSection = showBC && invNum ?
       '<div style="text-align:center;margin:4px 0 2px;">' +
       '<svg id="invBC" style="display:block;margin:0 auto;max-width:100%;"></svg>' +
       '<div class="barcode-num">' + esc(invNum) + '</div>' +
       '</div>' +
       '<script>' +
       'window.addEventListener("load",function(){' +
-      'try{JsBarcode("#invBC","' + safeInv + '",{' +
+      'try{JsBarcode("#invBC",' + JSON.stringify(invNum) + ',{' +
       'format:"CODE128",width:1.4,height:36,displayValue:false,margin:0,' +
       'background:"#fff",lineColor:"#000"' +
       '});}catch(e){}});' +
@@ -273,13 +332,14 @@
       '<div style="height:8mm;"></div>' +
       '</div>';
 
-    /* CSS */
+    /* ⑧ CSS + @media print للطابعات الحرارية */
     var css =
       '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}' +
       '@page{size:' + paperMm + 'mm auto;margin:2mm;}' +
       'html,body{width:100%;max-width:' + (paperMm-4) + 'mm;background:#fff;margin:0;padding:0;' +
       'font-family:"Courier New",Courier,monospace;' +
       'font-size:' + fontSize + ';font-weight:800;direction:rtl;color:#000;}' +
+      '@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact;}}' +
       '.content{width:' + printW + 'mm;margin:0 auto;}' +
       '.hdr-row td{font-size:' + fontSize + ';font-weight:900;padding:2px 0;}' +
       '.store-name{font-size:1.35em;font-weight:900;letter-spacing:.5px;margin:4px 0;text-align:center;}' +
@@ -328,9 +388,12 @@
     var showPrice= (await cfg('barcodeShowPrice', '1')) === '1';
     var storeName=  await cfg('storeName', '');
     var currency =  await cfg('currency',  'DA');
+    /* ⑨ عرض الباركود قابل للضبط من الإعدادات */
+    var bcWidth  = parseFloat(await cfg('barcodeWidth', '1.4')) || 1.4;
 
     var sz = LABEL_SIZES[rawSize] || {w:40,h:30};
-    var n  = Math.max(1, Math.min(500, parseInt(copies) || 1));
+    /* ⑥ حد أقصى 200 نسخة بدل 500 */
+    var n  = Math.max(1, Math.min(200, parseInt(copies) || 1));
 
     var code     = String(product.barcode || '');
     var name     = String(product.name    || '');
@@ -344,23 +407,23 @@
     var FSprice = Math.max(5, fontSize + 1);
     var PX_MM   = 3.7795; /* 1mm = 3.7795 px على 96dpi */
 
-    /* ارتفاع الباركود SVG بالبكسل */
-    var topMm  = (showStore && storeName ? (FSstore + 1.5) / PX_MM / PX_MM : 0)
-               + (showName  && name      ? (FSname  + 1.5) / PX_MM / PX_MM : 0);
+    /* ④ ارتفاع الباركود SVG — حساب مصحح (لا قسمة مزدوجة) */
+    var topMm  = (showStore && storeName ? (FSstore + 1.5) / PX_MM : 0)
+               + (showName  && name      ? (FSname  + 1.5) / PX_MM : 0);
     var botMm  = (FScode + 2)  / PX_MM
                + (showPrice && priceStr ? (FSprice + 2) / PX_MM : 0);
     var bcH_mm = Math.max(4, sz.h - topMm - botMm - 2);
     var bcH_px = Math.round(bcH_mm * PX_MM);
 
-    /* خيارات JsBarcode */
+    /* خيارات JsBarcode — ⑨ استخدام bcWidth */
     var formats = {
-      CODE128:{format:'CODE128', width:1.4},
-      CODE39 :{format:'CODE39',  width:1.2},
-      EAN13  :{format:'EAN13',   width:1.5},
-      EAN8   :{format:'EAN8',    width:1.5},
-      UPCA   :{format:'UPC',     width:1.5},
-      ITF14  :{format:'ITF14',   width:1.4},
-      MSI    :{format:'MSI',     width:1.4},
+      CODE128:{format:'CODE128', width: bcWidth},
+      CODE39 :{format:'CODE39',  width: Math.max(1.0, bcWidth - 0.2)},
+      EAN13  :{format:'EAN13',   width: bcWidth},
+      EAN8   :{format:'EAN8',    width: bcWidth},
+      UPCA   :{format:'UPC',     width: bcWidth},
+      ITF14  :{format:'ITF14',   width: bcWidth},
+      MSI    :{format:'MSI',     width: bcWidth},
     };
     var bcOpt = formats[bcType] || formats.CODE128;
 
@@ -378,23 +441,26 @@
         '</div>';
     }
 
-    var safeCode = code.replace(/['"\\]/g,'');
+    /* ① JsBarcode — JSON.stringify بدل دمج النصوص */
     var initJS =
       '<script>' +
       'window.addEventListener("load",function(){' +
-      'var opt={format:"' + esc(bcOpt.format) + '",width:' + bcOpt.width + ',' +
+      'var opt={format:' + JSON.stringify(bcOpt.format) + ',width:' + bcOpt.width + ',' +
       'height:' + bcH_px + ',displayValue:false,margin:0,' +
       'background:"#fff",lineColor:"#000"};' +
+      'var code=' + JSON.stringify(code) + ';' +
       'for(var i=0;i<' + n + ';i++){' +
-      'try{JsBarcode("#bc_"+i,"' + safeCode + '",opt);}catch(e){}' +
+      'try{JsBarcode("#bc_"+i,code,opt);}catch(e){}' +
       '}});' +
       '<\/script>';
 
+    /* ⑧ CSS + @media print للطابعات الحرارية */
     var css =
       '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}' +
       '@page{size:' + sz.w + 'mm ' + sz.h + 'mm;margin:0;}' +
       'html,body{width:' + sz.w + 'mm;background:#fff;' +
       'font-family:"Tahoma","Arial",sans-serif;color:#000;}' +
+      '@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact;}}' +
       '.label{width:' + sz.w + 'mm;height:' + sz.h + 'mm;' +
       'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
       'padding:.8mm 1mm;overflow:hidden;' +
@@ -436,7 +502,11 @@
     );
     if (name == null) return;
     var trimmed = name.trim();
-    try { await window.setSetting(key, trimmed); } catch(e) {}
+    try {
+      await window.setSetting(key, trimmed);
+      /* مسح Cache ليقرأ القيمة الجديدة */
+      delete _SETTINGS_CACHE[key];
+    } catch(e) {}
     var el = document.getElementById(nameId);
     var cd = document.getElementById(cardId);
     if (el) el.textContent = trimmed || 'الطابعة الافتراضية';
@@ -448,12 +518,14 @@
   /* ══════════════════════════════════════════════════════
      تصدير
      ══════════════════════════════════════════════════════ */
-  window.printInvoice = printInvoice;
-  window.POSDZ_PRINT  = {
-    invoice      : printInvoice,
-    barcode      : printBarcode,
-    choosePrinter: choosePrinter,
-    LABEL_SIZES  : LABEL_SIZES,
+  window.printInvoice       = printInvoice;
+  window.clearPrintCache    = clearSettingsCache;
+  window.POSDZ_PRINT        = {
+    invoice           : printInvoice,
+    barcode           : printBarcode,
+    choosePrinter     : choosePrinter,
+    LABEL_SIZES       : LABEL_SIZES,
+    clearSettingsCache: clearSettingsCache,
   };
 
 })(window);
